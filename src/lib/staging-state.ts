@@ -3,21 +3,25 @@ import path from "node:path";
 import users from "@/data/users.json";
 import {
   EMPTY_STAGING_ASSIGNMENTS,
+  EMPTY_STAGING_STARTED_AT,
   STAGING_ENVIRONMENTS,
   type StagingAssignments,
   type StagingDestination,
   type StagingEnvironment,
+  type StagingStartedAt,
 } from "@/types/staging";
 import type { User } from "@/types/user";
 
 export type StagingState = {
   assignments: StagingAssignments;
+  startedAt: StagingStartedAt;
   updatedAt: string;
   slackStatusMessageTs: string | null;
 };
 
 type LegacyStagingState = {
   usingStagingUserIds?: string[];
+  startedAt?: unknown;
   updatedAt?: string;
   slackStatusMessageTs?: string;
 };
@@ -47,14 +51,21 @@ const stateFilePath = isVercelRuntime
 
 const defaultState: StagingState = {
   assignments: { ...EMPTY_STAGING_ASSIGNMENTS },
+  startedAt: { ...EMPTY_STAGING_STARTED_AT },
   updatedAt: "",
   slackStatusMessageTs: null,
 };
 
 let inMemoryState: StagingState | null = null;
+let hasAttemptedSlackRecovery = false;
+let isRecoveringFromSlack = false;
 
 function createEmptyAssignments(): StagingAssignments {
   return { ...EMPTY_STAGING_ASSIGNMENTS };
+}
+
+function createEmptyStartedAt(): StagingStartedAt {
+  return { ...EMPTY_STAGING_STARTED_AT };
 }
 
 function sanitizeUserIds(ids: string[]) {
@@ -77,6 +88,52 @@ function sanitizeAssignments(input: unknown): StagingAssignments {
   return nextAssignments;
 }
 
+function sanitizeStartedAt(
+  input: unknown,
+  assignments: StagingAssignments,
+): StagingStartedAt {
+  const nextStartedAt = createEmptyStartedAt();
+
+  if (!input || typeof input !== "object") {
+    return nextStartedAt;
+  }
+
+  for (const environment of STAGING_ENVIRONMENTS) {
+    const candidate = (input as Partial<Record<StagingEnvironment, unknown>>)[environment];
+
+    if (!assignments[environment]) {
+      nextStartedAt[environment] = null;
+      continue;
+    }
+
+    if (typeof candidate !== "string") {
+      nextStartedAt[environment] = null;
+      continue;
+    }
+
+    nextStartedAt[environment] =
+      Number.isNaN(Date.parse(candidate)) ? null : candidate;
+  }
+
+  return nextStartedAt;
+}
+
+function buildStartedAtFromUpdatedAt(
+  assignments: StagingAssignments,
+  updatedAt: string,
+): StagingStartedAt {
+  const nextStartedAt = createEmptyStartedAt();
+  const hasValidUpdatedAt = Boolean(updatedAt) && !Number.isNaN(Date.parse(updatedAt));
+
+  for (const environment of STAGING_ENVIRONMENTS) {
+    if (assignments[environment] && hasValidUpdatedAt) {
+      nextStartedAt[environment] = updatedAt;
+    }
+  }
+
+  return nextStartedAt;
+}
+
 function migrateLegacyState(parsed: LegacyStagingState): StagingAssignments {
   const legacyUserIds = sanitizeUserIds(
     Array.isArray(parsed.usingStagingUserIds) ? parsed.usingStagingUserIds : [],
@@ -89,6 +146,60 @@ function migrateLegacyState(parsed: LegacyStagingState): StagingAssignments {
   }
 
   return nextAssignments;
+}
+
+function hasAssignedUsers(assignments: StagingAssignments) {
+  return STAGING_ENVIRONMENTS.some((environment) => Boolean(assignments[environment]));
+}
+
+function shouldAttemptSlackRecovery(state: StagingState) {
+  return (
+    isVercelRuntime &&
+    !hasAttemptedSlackRecovery &&
+    !isRecoveringFromSlack &&
+    !state.updatedAt &&
+    !state.slackStatusMessageTs &&
+    !hasAssignedUsers(state.assignments)
+  );
+}
+
+async function recoverStateFromSlack() {
+  if (!isVercelRuntime || hasAttemptedSlackRecovery || isRecoveringFromSlack) {
+    return null;
+  }
+
+  hasAttemptedSlackRecovery = true;
+  isRecoveringFromSlack = true;
+
+  try {
+    const slackModule = await import("@/lib/slack");
+    const recovered = await slackModule.recoverStagingStateFromSlack();
+
+    if (!recovered) {
+      return null;
+    }
+
+    const recoveredAssignments = sanitizeAssignments(recovered.assignments);
+    const recoveredState: StagingState = {
+      assignments: recoveredAssignments,
+      startedAt: sanitizeStartedAt(recovered.startedAt, recoveredAssignments),
+      updatedAt:
+        typeof recovered.updatedAt === "string" && recovered.updatedAt
+          ? recovered.updatedAt
+          : new Date().toISOString(),
+      slackStatusMessageTs:
+        typeof recovered.slackStatusMessageTs === "string"
+          ? recovered.slackStatusMessageTs
+          : null,
+    };
+
+    await writeState(recoveredState);
+    return recoveredState;
+  } catch {
+    return null;
+  } finally {
+    isRecoveringFromSlack = false;
+  }
 }
 
 async function writeState(state: StagingState) {
@@ -154,23 +265,40 @@ export async function getStagingState(): Promise<StagingState> {
       parsed.assignments !== null &&
       typeof parsed.assignments === "object" &&
       !Array.isArray(parsed.assignments);
+    const hasStartedAt =
+      parsed.startedAt !== null &&
+      typeof parsed.startedAt === "object" &&
+      !Array.isArray(parsed.startedAt);
 
     const assignments = hasAssignments
       ? sanitizeAssignments(parsed.assignments)
       : migrateLegacyState(parsed);
+    const updatedAt =
+      typeof parsed.updatedAt === "string" ? parsed.updatedAt : defaultState.updatedAt;
+    const startedAt =
+      hasStartedAt
+        ? sanitizeStartedAt(parsed.startedAt, assignments)
+        : buildStartedAtFromUpdatedAt(assignments, updatedAt);
 
     const state: StagingState = {
       assignments,
-      updatedAt:
-        typeof parsed.updatedAt === "string" ? parsed.updatedAt : defaultState.updatedAt,
+      startedAt,
+      updatedAt,
       slackStatusMessageTs:
         typeof parsed.slackStatusMessageTs === "string"
           ? parsed.slackStatusMessageTs
           : defaultState.slackStatusMessageTs,
     };
 
-    if (!hasAssignments) {
+    if (!hasAssignments || !hasStartedAt) {
       await writeState(state);
+    }
+
+    if (shouldAttemptSlackRecovery(state)) {
+      const recoveredState = await recoverStateFromSlack();
+      if (recoveredState) {
+        return recoveredState;
+      }
     }
 
     inMemoryState = state;
@@ -179,6 +307,11 @@ export async function getStagingState(): Promise<StagingState> {
   } catch {
     if (inMemoryState) {
       return inMemoryState;
+    }
+
+    const recoveredState = await recoverStateFromSlack();
+    if (recoveredState) {
+      return recoveredState;
     }
 
     await writeState(defaultState);
@@ -193,6 +326,7 @@ export async function moveUserToDestination(
 ): Promise<MoveUserResult> {
   const currentState = await getStagingState();
   const assignments = { ...currentState.assignments };
+  const startedAt = { ...currentState.startedAt };
   const previousEnvironments = getEnvironmentsForUser(assignments, userId);
   const previousEnvironment = previousEnvironments[0] || null;
 
@@ -209,9 +343,11 @@ export async function moveUserToDestination(
       }
 
       assignments[sourceEnvironment] = null;
+      startedAt[sourceEnvironment] = null;
 
       const nextState: StagingState = {
         assignments: sanitizeAssignments(assignments),
+        startedAt: sanitizeStartedAt(startedAt, assignments),
         updatedAt: new Date().toISOString(),
         slackStatusMessageTs: currentState.slackStatusMessageTs,
       };
@@ -239,10 +375,12 @@ export async function moveUserToDestination(
 
     for (const environment of previousEnvironments) {
       assignments[environment] = null;
+      startedAt[environment] = null;
     }
 
     const nextState: StagingState = {
       assignments: sanitizeAssignments(assignments),
+      startedAt: sanitizeStartedAt(startedAt, assignments),
       updatedAt: new Date().toISOString(),
       slackStatusMessageTs: currentState.slackStatusMessageTs,
     };
@@ -281,9 +419,11 @@ export async function moveUserToDestination(
   }
 
   assignments[destination] = userId;
+  startedAt[destination] = new Date().toISOString();
 
   const nextState: StagingState = {
     assignments: sanitizeAssignments(assignments),
+    startedAt: sanitizeStartedAt(startedAt, assignments),
     updatedAt: new Date().toISOString(),
     slackStatusMessageTs: currentState.slackStatusMessageTs,
   };
@@ -325,6 +465,7 @@ export async function getStagingOccupancy() {
     return {
       environment,
       user: userId ? usersById.get(userId) || null : null,
+      startedAt: state.startedAt[environment],
     };
   });
 }

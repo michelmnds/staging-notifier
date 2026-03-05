@@ -1,10 +1,18 @@
 import { createHmac, timingSafeEqual } from "node:crypto";
+import users from "@/data/users.json";
 import {
   getStagingOccupancy,
   getStagingState,
   setSlackStatusMessageTs,
 } from "@/lib/staging-state";
-import type { StagingEnvironment } from "@/types/staging";
+import {
+  EMPTY_STAGING_ASSIGNMENTS,
+  EMPTY_STAGING_STARTED_AT,
+  type StagingAssignments,
+  type StagingEnvironment,
+  type StagingStartedAt,
+} from "@/types/staging";
+import type { User } from "@/types/user";
 
 type SlackResult = {
   ok: boolean;
@@ -21,10 +29,18 @@ type SlackApiResponse = {
   ok?: boolean;
   error?: string;
   ts?: string;
+  text?: string;
   channels?: Array<{
     id: string;
     name: string;
   }>;
+  messages?: Array<{
+    ts?: string;
+    text?: string;
+  }>;
+  response_metadata?: {
+    next_cursor?: string;
+  };
 };
 
 type OccupancyItem = {
@@ -32,15 +48,168 @@ type OccupancyItem = {
   user: {
     name: string;
   } | null;
+  startedAt: string | null;
 };
+
+export type RecoveredStagingState = {
+  assignments: StagingAssignments;
+  startedAt: StagingStartedAt;
+  updatedAt: string;
+  slackStatusMessageTs: string;
+};
+
+const usersList = users as User[];
 
 const channelIdPattern = /^[CGD][A-Z0-9]{8,}$/;
 const environmentLabelByKey: Record<StagingEnvironment, string> = {
   backend: "Backend",
-  "payer-app": "Payer App",
   "payer-web": "Payer Web",
   "business-web": "Business Web",
 };
+const normalizedLabelToEnvironment = new Map(
+  Object.entries(environmentLabelByKey).map(([environment, label]) => [
+    normalizeText(label),
+    environment as StagingEnvironment,
+  ]),
+);
+const userIdByNormalizedName = new Map<string, string>();
+
+for (const user of usersList) {
+  const candidateNames = [user.name, user["slack-name"]].filter(
+    (value): value is string => Boolean(value && value.trim()),
+  );
+
+  for (const candidateName of candidateNames) {
+    const normalizedName = normalizeText(candidateName);
+    if (!normalizedName || userIdByNormalizedName.has(normalizedName)) {
+      continue;
+    }
+
+    userIdByNormalizedName.set(normalizedName, user.id);
+  }
+}
+
+function normalizeText(value: string) {
+  return value
+    .normalize("NFKD")
+    .toLowerCase()
+    .replace(/[^\w\s-]/g, " ")
+    .replace(/[_-]+/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function slackTsToIso(ts: string) {
+  const [secondsPart] = ts.split(".");
+  const seconds = Number(secondsPart);
+
+  if (Number.isNaN(seconds)) {
+    return new Date().toISOString();
+  }
+
+  return new Date(seconds * 1000).toISOString();
+}
+
+function createEmptyStartedAt(): StagingStartedAt {
+  return { ...EMPTY_STAGING_STARTED_AT };
+}
+
+function formatSlackTimeToken(startedAt: string | null) {
+  if (!startedAt) {
+    return null;
+  }
+
+  const dateMs = Date.parse(startedAt);
+  if (Number.isNaN(dateMs)) {
+    return null;
+  }
+
+  return `${new Intl.DateTimeFormat("en-GB", {
+    hour: "2-digit",
+    minute: "2-digit",
+    hour12: false,
+    timeZone: "Europe/Berlin",
+  }).format(new Date(dateMs))} (DE time)`;
+}
+
+function parseStartedAtToken(rawToken: string | undefined) {
+  if (!rawToken) {
+    return null;
+  }
+
+  const match = rawToken.match(/<!date\^(\d+)\^[^|>]+(?:\|[^>]+)?>/);
+  if (!match) {
+    return null;
+  }
+
+  const seconds = Number(match[1]);
+  if (Number.isNaN(seconds)) {
+    return null;
+  }
+
+  return new Date(seconds * 1000).toISOString();
+}
+
+function looksLikeStagingStatusText(text: string) {
+  const normalized = normalizeText(text);
+  return (
+    normalized.startsWith("environments") &&
+    (normalized.includes("free to use") || normalized.includes("is using it"))
+  );
+}
+
+function parseStateFromStatusText(text: string) {
+  const assignments: StagingAssignments = { ...EMPTY_STAGING_ASSIGNMENTS };
+  const startedAt: StagingStartedAt = createEmptyStartedAt();
+  const lines = text.split(/\r?\n/);
+
+  for (const rawLine of lines) {
+    const trimmedLine = rawLine.trim();
+    if (!trimmedLine) {
+      continue;
+    }
+
+    if (normalizeText(trimmedLine) === "environments") {
+      continue;
+    }
+
+    const lineWithoutPrefix = trimmedLine.replace(/^[•✅❌]\s*/, "");
+    const separatorIndex = lineWithoutPrefix.indexOf(":");
+
+    if (separatorIndex === -1) {
+      continue;
+    }
+
+    const label = lineWithoutPrefix.slice(0, separatorIndex).trim();
+    const statusText = lineWithoutPrefix.slice(separatorIndex + 1).trim();
+    const environment = normalizedLabelToEnvironment.get(normalizeText(label));
+
+    if (!environment) {
+      continue;
+    }
+
+    if (normalizeText(statusText) === "free to use") {
+      assignments[environment] = null;
+      startedAt[environment] = null;
+      continue;
+    }
+
+    const inUseMatch = statusText.match(
+      /^(.+?)\s+is\s+using\s+it(?:\s+since\s+(.+))?$/i,
+    );
+    if (!inUseMatch) {
+      continue;
+    }
+
+    const candidateName = normalizeText(inUseMatch[1]);
+    assignments[environment] = candidateName
+      ? userIdByNormalizedName.get(candidateName) || null
+      : null;
+    startedAt[environment] = parseStartedAtToken(inUseMatch[2]);
+  }
+
+  return { assignments, startedAt };
+}
 
 function normalizeChannelInput(rawChannel: string) {
   const trimmed = rawChannel.trim();
@@ -111,15 +280,99 @@ async function resolveChannelId(token: string, rawChannel: string) {
   return { channelId: byNameResult.channelId };
 }
 
+async function findLatestStagingStatusMessage(token: string, channel: string) {
+  let cursor: string | undefined;
+  let pages = 0;
+
+  while (pages < 5) {
+    pages += 1;
+
+    const body: Record<string, unknown> = {
+      channel,
+      limit: 200,
+    };
+
+    if (cursor) {
+      body.cursor = cursor;
+    }
+
+    const { response, payload } = await slackJsonRequest(
+      token,
+      "conversations.history",
+      body,
+    );
+
+    if (!response.ok || payload.ok !== true || !Array.isArray(payload.messages)) {
+      return null;
+    }
+
+    const match = payload.messages.find(
+      (message) =>
+        typeof message.ts === "string" &&
+        typeof message.text === "string" &&
+        looksLikeStagingStatusText(message.text),
+    );
+
+    if (match && match.ts && match.text) {
+      return {
+        ts: match.ts,
+        text: match.text,
+      };
+    }
+
+    const nextCursor = payload.response_metadata?.next_cursor?.trim();
+    if (!nextCursor) {
+      break;
+    }
+
+    cursor = nextCursor;
+  }
+
+  return null;
+}
+
+export async function recoverStagingStateFromSlack(): Promise<RecoveredStagingState | null> {
+  const token = process.env.SLACK_BOT_TOKEN;
+  const channel = process.env.SLACK_CHANNEL || "#coders";
+
+  if (!token) {
+    return null;
+  }
+
+  try {
+    const resolvedChannel = await resolveChannelId(token, channel);
+    const message = await findLatestStagingStatusMessage(token, resolvedChannel.channelId);
+
+    if (!message) {
+      return null;
+    }
+
+    const parsedState = parseStateFromStatusText(message.text);
+
+    return {
+      assignments: parsedState.assignments,
+      startedAt: parsedState.startedAt,
+      updatedAt: slackTsToIso(message.ts),
+      slackStatusMessageTs: message.ts,
+    };
+  } catch {
+    return null;
+  }
+}
+
 export function formatStagingStatusText(occupancy: OccupancyItem[]) {
   const lines = occupancy.map((item) => {
     const label = environmentLabelByKey[item.environment];
 
     if (!item.user) {
-      return `• ${label}: Free to use`;
+      return `✅ ${label}: Free to use`;
     }
 
-    return `• ${label}: ${item.user.name} is using it`;
+    const startedAtText = formatSlackTimeToken(item.startedAt);
+
+    return startedAtText
+      ? `❌ ${label}: ${item.user.name} is using it since ${startedAtText}`
+      : `❌ ${label}: ${item.user.name} is using it`;
   });
 
   return `*Environments:*\n${lines.join("\n")}`;
@@ -194,7 +447,15 @@ export async function syncStagingStatusMessage(): Promise<SlackResult> {
     const channelToUse = resolvedChannel.channelId;
     const currentState = await getStagingState();
     const fallbackTs = process.env.SLACK_STATUS_MESSAGE_TS?.trim() || null;
-    const statusMessageTs = currentState.slackStatusMessageTs || fallbackTs;
+    let statusMessageTs = currentState.slackStatusMessageTs || fallbackTs;
+
+    if (!statusMessageTs) {
+      const recoveredState = await recoverStagingStateFromSlack();
+      if (recoveredState?.slackStatusMessageTs) {
+        statusMessageTs = recoveredState.slackStatusMessageTs;
+        await setSlackStatusMessageTs(statusMessageTs);
+      }
+    }
 
     if (statusMessageTs) {
       const updateAttempt = await slackWriteRequestWithJoin(token, "chat.update", {

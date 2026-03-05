@@ -21,6 +21,7 @@ import {
   type StagingAssignments,
   type StagingDestination,
   type StagingEnvironment,
+  type StagingStartedAt,
 } from "@/types/staging";
 import type { User } from "@/types/user";
 
@@ -29,12 +30,14 @@ type ZoneId = "pool" | StagingEnvironment;
 type StagingDashboardProps = {
   users: User[];
   initialAssignments: StagingAssignments;
+  initialStartedAt: StagingStartedAt;
 };
 
 type MoveResponse = {
   ok: boolean;
   error?: string;
   assignments?: StagingAssignments;
+  startedAt?: StagingStartedAt;
   occupiedByName?: string;
   notification?: {
     userName: string;
@@ -51,6 +54,7 @@ type NotifyResponse = {
 type StatusResponse = {
   ok: boolean;
   assignments?: StagingAssignments;
+  startedAt?: StagingStartedAt;
 };
 
 type EnvironmentMeta = {
@@ -72,15 +76,6 @@ const environmentMeta: Record<StagingEnvironment, EnvironmentMeta> = {
     badgeClass: "bg-[#001f3f] text-white",
     nameClass: "text-[#001f3f]",
   },
-  "payer-app": {
-    title: "payer-app",
-    subtitle: "Mobile app flow",
-    tintClass:
-      "bg-gradient-to-br from-[#0f766e]/28 via-[#0f766e]/14 to-transparent",
-    activeClass: "ring-[#0f766e]/40 shadow-[0_20px_55px_rgba(15,118,110,0.30)]",
-    badgeClass: "bg-[#0f766e] text-white",
-    nameClass: "text-[#0f766e]",
-  },
   "payer-web": {
     title: "payer-web",
     subtitle: "Web checkout flow",
@@ -100,6 +95,26 @@ const environmentMeta: Record<StagingEnvironment, EnvironmentMeta> = {
     nameClass: "text-[#b45309]",
   },
 };
+
+function formatStartedAt(value: string | null) {
+  if (!value) {
+    return "";
+  }
+
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) {
+    return "";
+  }
+
+  const timeText = new Intl.DateTimeFormat(undefined, {
+    hour: "2-digit",
+    minute: "2-digit",
+    hour12: false,
+    timeZone: "Europe/Berlin",
+  }).format(date);
+
+  return `${timeText} (DE time)`;
+}
 
 type UserCardVisualProps = {
   user: User;
@@ -203,6 +218,7 @@ function UserCardVisual({
 type DraggableUserCardProps = {
   user: User;
   sourceZone: ZoneId;
+  startedAt?: string | null;
   activeDraggableId: string | null;
   pendingUserId: string | null;
   onMove: (
@@ -215,6 +231,7 @@ type DraggableUserCardProps = {
 function DraggableUserCard({
   user,
   sourceZone,
+  startedAt = null,
   activeDraggableId,
   pendingUserId,
   onMove,
@@ -234,7 +251,13 @@ function DraggableUserCard({
 
   const busy = pendingUserId !== null;
 
-  const subtitle = sourceZone === "pool" ? "" : `Using ${sourceZone}`;
+  const formattedStartedAt = formatStartedAt(startedAt);
+  const subtitle =
+    sourceZone === "pool"
+      ? ""
+      : formattedStartedAt
+        ? `Started at ${formattedStartedAt}`
+        : `Using ${sourceZone}`;
   const actionLabel = sourceZone === "pool" ? undefined : "Remove";
   const onAction =
     sourceZone === "pool"
@@ -343,6 +366,7 @@ function PoolZone({
 type EnvironmentZoneProps = {
   environment: StagingEnvironment;
   user: User | null;
+  startedAt: string | null;
   activeDraggableId: string | null;
   hoveredZone: ZoneId | null;
   pendingUserId: string | null;
@@ -356,6 +380,7 @@ type EnvironmentZoneProps = {
 function EnvironmentZone({
   environment,
   user,
+  startedAt,
   activeDraggableId,
   hoveredZone,
   pendingUserId,
@@ -403,6 +428,7 @@ function EnvironmentZone({
           <DraggableUserCard
             user={user}
             sourceZone={environment}
+            startedAt={startedAt}
             activeDraggableId={activeDraggableId}
             pendingUserId={pendingUserId}
             onMove={onMove}
@@ -480,9 +506,20 @@ function assignmentsEqual(a: StagingAssignments, b: StagingAssignments) {
   return true;
 }
 
+function startedAtEqual(a: StagingStartedAt, b: StagingStartedAt) {
+  for (const environment of STAGING_ENVIRONMENTS) {
+    if (a[environment] !== b[environment]) {
+      return false;
+    }
+  }
+
+  return true;
+}
+
 export default function StagingDashboard({
   users,
   initialAssignments,
+  initialStartedAt,
 }: StagingDashboardProps) {
   const sensors = useSensors(
     useSensor(PointerSensor, {
@@ -505,6 +542,8 @@ export default function StagingDashboard({
 
   const [assignments, setAssignments] =
     useState<StagingAssignments>(initialAssignments);
+  const [startedAt, setStartedAt] =
+    useState<StagingStartedAt>(initialStartedAt);
   const [activeDraggableId, setActiveDraggableId] = useState<string | null>(null);
   const [activeUserId, setActiveUserId] = useState<string | null>(null);
   const [hoveredZone, setHoveredZone] = useState<ZoneId | null>(null);
@@ -533,7 +572,7 @@ export default function StagingDashboard({
 
         const payload = (await response.json()) as StatusResponse;
 
-        if (!payload.ok || !payload.assignments) {
+        if (!payload.ok || !payload.assignments || !payload.startedAt) {
           return;
         }
 
@@ -541,6 +580,11 @@ export default function StagingDashboard({
           assignmentsEqual(current, payload.assignments!)
             ? current
             : payload.assignments!,
+        );
+        setStartedAt((current) =>
+          startedAtEqual(current, payload.startedAt!)
+            ? current
+            : payload.startedAt!,
         );
       } catch {
         // Poll quietly; explicit move/slack errors are surfaced elsewhere.
@@ -610,7 +654,7 @@ export default function StagingDashboard({
 
       const payload = (await response.json()) as MoveResponse;
 
-      if (!response.ok || !payload.ok || !payload.assignments) {
+      if (!response.ok || !payload.ok || !payload.assignments || !payload.startedAt) {
         if (payload.occupiedByName) {
           setMessage(
             payload.error ||
@@ -623,6 +667,7 @@ export default function StagingDashboard({
       }
 
       setAssignments(payload.assignments);
+      setStartedAt(payload.startedAt);
       setMessage("");
 
       if (payload.notification) {
@@ -737,6 +782,7 @@ export default function StagingDashboard({
                   key={environment}
                   environment={environment}
                   user={environmentUsers.get(environment) || null}
+                  startedAt={startedAt[environment]}
                   activeDraggableId={activeDraggableId}
                   hoveredZone={hoveredZone}
                   pendingUserId={pendingUserId}

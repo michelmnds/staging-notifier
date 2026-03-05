@@ -13,6 +13,7 @@ export default async function Home() {
     <StagingDashboard
       users={allUsers}
       initialAssignments={state.assignments}
+      initialStartedAt={state.startedAt}
     />
   );
 }

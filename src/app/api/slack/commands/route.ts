@@ -18,8 +18,6 @@ const usersList = users as User[];
 
 const environmentAliasMap: Record<string, StagingEnvironment> = {
   backend: "backend",
-  "payer-app": "payer-app",
-  payerapp: "payer-app",
   "payer-web": "payer-web",
   payerweb: "payer-web",
   "business-web": "business-web",
@@ -28,7 +26,6 @@ const environmentAliasMap: Record<string, StagingEnvironment> = {
 
 const environmentLabelByKey: Record<StagingEnvironment, string> = {
   backend: "backend",
-  "payer-app": "payer-app",
   "payer-web": "payer-web",
   "business-web": "business-web",
 };

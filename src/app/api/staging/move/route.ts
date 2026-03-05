@@ -80,6 +80,7 @@ export async function POST(request: Request) {
           error: `${result.destination} is already occupied.`,
           occupiedByName: occupyingUser?.name,
           assignments: result.state.assignments,
+          startedAt: result.state.startedAt,
         },
         { status: 409 },
       );
@@ -96,6 +97,7 @@ export async function POST(request: Request) {
     return NextResponse.json({
       ok: true,
       assignments: result.state.assignments,
+      startedAt: result.state.startedAt,
       notification,
     });
   } catch {

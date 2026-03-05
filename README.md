@@ -3,7 +3,7 @@
 Glass dashboard with:
 
 - Left: users
-- Right: 4 staging cards (`backend`, `payer-app`, `payer-web`, `business-web`)
+- Right: 3 staging cards (`backend`, `payer-web`, `business-web`)
 
 Users come from a local JSON file (`src/data/users.json`), and you can drag cards between zones.
 Each staging card supports a maximum of 1 user.
@@ -15,6 +15,7 @@ When a user moves:
 - message format:
   - `Environments:`
   - `Backend: Free to use` or `Backend: <name> is using it`
+  - occupied environments include `since HH:mm (DE time)`
   - same for the other cards
 
 There is also a Slack slash command endpoint for:
