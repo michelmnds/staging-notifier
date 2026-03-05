@@ -1,0 +1,66 @@
+@import "tailwindcss";
+
+:root {
+  --color-main: #c7f9cc;
+  --color-secondary: #001f3f;
+  --color-white: #ffffff;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  min-height: 100vh;
+  margin: 0;
+  background:
+    radial-gradient(circle at 8% 10%, rgba(199, 249, 204, 0.78), transparent 36%),
+    radial-gradient(circle at 90% 20%, rgba(0, 31, 63, 0.16), transparent 40%),
+    linear-gradient(155deg, #ffffff 0%, #f1fff4 50%, #dcfae2 100%);
+  color: var(--color-secondary);
+  font-family: var(--font-geist-sans), "Segoe UI", sans-serif;
+}
+
+a {
+  color: inherit;
+}
+
+@theme inline {
+  --color-main: var(--color-main);
+  --color-secondary: var(--color-secondary);
+  --color-surface: var(--color-white);
+  --font-sans: var(--font-geist-sans);
+}
+
+.glass-panel {
+  background: linear-gradient(
+    145deg,
+    rgba(255, 255, 255, 0.62),
+    rgba(255, 255, 255, 0.3)
+  );
+  border: 1px solid rgba(255, 255, 255, 0.65);
+  backdrop-filter: blur(22px);
+  box-shadow:
+    0 20px 48px rgba(0, 31, 63, 0.18),
+    inset 0 1px 0 rgba(255, 255, 255, 0.75);
+}
+
+@keyframes glass-float {
+  0%,
+  100% {
+    transform: translate3d(0, 0, 0);
+  }
+
+  50% {
+    transform: translate3d(0, -18px, 0);
+  }
+}
+
+.glass-orb {
+  animation: glass-float 15s ease-in-out infinite;
+}
+
+.glass-orb-alt {
+  animation: glass-float 19s ease-in-out infinite;
+  animation-delay: -5s;
+}
