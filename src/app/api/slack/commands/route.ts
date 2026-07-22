@@ -1,14 +1,10 @@
 import { NextResponse } from "next/server";
 import users from "@/data/users.json";
 import {
-  formatStagingStatusText,
-  syncStagingStatusMessage,
+  postStagingChangeNotifications,
   verifySlackRequest,
 } from "@/lib/slack";
-import {
-  getStagingOccupancy,
-  moveUserToDestination,
-} from "@/lib/staging-state";
+import { moveUserToDestination } from "@/lib/staging-state";
 import { STAGING_ENVIRONMENTS, type StagingEnvironment } from "@/types/staging";
 import type { User } from "@/types/user";
 
@@ -238,21 +234,25 @@ async function handleTakeCommand(params: URLSearchParams) {
     });
   }
 
-  const slackSync = await syncStagingStatusMessage();
-
-  if (!slackSync.ok) {
-    return NextResponse.json({
-      response_type: "ephemeral",
-      text:
-        `${matchedUser.name} was assigned to ${environmentLabelByKey[destination]}, ` +
-        `but Slack status sync failed: ${slackSync.error || "unknown error"}.`,
-    });
-  }
-
   if (!moveResult.changed) {
     return NextResponse.json({
       response_type: "ephemeral",
       text: `${matchedUser.name} is already using ${environmentLabelByKey[destination]}.`,
+    });
+  }
+
+  const slackNotification = await postStagingChangeNotifications({
+    userName: matchedUser.name,
+    takenEnvironment: moveResult.takenEnvironment,
+    releasedEnvironments: moveResult.releasedEnvironments,
+  });
+
+  if (!slackNotification.ok) {
+    return NextResponse.json({
+      response_type: "ephemeral",
+      text:
+        `${matchedUser.name} was assigned to ${environmentLabelByKey[destination]}, ` +
+        `but the #coders notification failed: ${slackNotification.error || "unknown error"}.`,
     });
   }
 
@@ -276,7 +276,6 @@ async function handleRemoveCommand(params: URLSearchParams) {
   }
 
   const moveResult = await moveUserToDestination(matchedUser.id, "pool");
-  const slackSync = await syncStagingStatusMessage();
 
   if (!moveResult.ok) {
     return NextResponse.json({
@@ -285,19 +284,25 @@ async function handleRemoveCommand(params: URLSearchParams) {
     });
   }
 
-  if (!slackSync.ok) {
-    return NextResponse.json({
-      response_type: "ephemeral",
-      text:
-        `${matchedUser.name} was removed from staging, ` +
-        `but Slack status sync failed: ${slackSync.error || "unknown error"}.`,
-    });
-  }
-
   if (!moveResult.changed) {
     return NextResponse.json({
       response_type: "ephemeral",
       text: `${matchedUser.name} is not using any staging environment.`,
+    });
+  }
+
+  const slackNotification = await postStagingChangeNotifications({
+    userName: matchedUser.name,
+    takenEnvironment: moveResult.takenEnvironment,
+    releasedEnvironments: moveResult.releasedEnvironments,
+  });
+
+  if (!slackNotification.ok) {
+    return NextResponse.json({
+      response_type: "ephemeral",
+      text:
+        `${matchedUser.name} was removed from staging, ` +
+        `but the #coders notification failed: ${slackNotification.error || "unknown error"}.`,
     });
   }
 

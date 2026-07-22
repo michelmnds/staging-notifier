@@ -1,5 +1,6 @@
 import { NextResponse } from "next/server";
 import users from "@/data/users.json";
+import { postStagingChangeNotifications } from "@/lib/slack";
 import { moveUserToDestination } from "@/lib/staging-state";
 import {
   STAGING_ENVIRONMENTS,
@@ -16,19 +17,19 @@ type MovePayload = {
   sourceEnvironment?: StagingEnvironment | null;
 };
 
-type NotificationPayload = {
-  userName: string;
-  previousEnvironment: StagingEnvironment | null;
-  nextEnvironment: StagingEnvironment | null;
-};
-
 const usersList = users as User[];
 
 export async function POST(request: Request) {
   let payload: MovePayload;
 
   try {
-    payload = (await request.json()) as MovePayload;
+    const parsedPayload = (await request.json()) as unknown;
+
+    if (!parsedPayload || typeof parsedPayload !== "object") {
+      throw new Error("Invalid payload shape.");
+    }
+
+    payload = parsedPayload as MovePayload;
   } catch {
     return NextResponse.json(
       { ok: false, error: "Invalid JSON payload." },
@@ -36,11 +37,12 @@ export async function POST(request: Request) {
     );
   }
 
-  const userId = payload.userId?.trim();
+  const userId = typeof payload.userId === "string" ? payload.userId.trim() : undefined;
   const destination = payload.destination;
   const sourceEnvironment =
     payload.sourceEnvironment === null ||
-    STAGING_ENVIRONMENTS.includes(payload.sourceEnvironment as StagingEnvironment)
+    (typeof payload.sourceEnvironment === "string" &&
+      STAGING_ENVIRONMENTS.includes(payload.sourceEnvironment as StagingEnvironment))
       ? payload.sourceEnvironment
       : undefined;
   const isValidDestination =
@@ -86,19 +88,19 @@ export async function POST(request: Request) {
       );
     }
 
-    const notification: NotificationPayload | null = result.changed
-      ? {
+    const notification = result.changed
+      ? await postStagingChangeNotifications({
           userName: user.name,
-          previousEnvironment: result.previousEnvironment,
-          nextEnvironment: result.nextEnvironment,
-        }
-      : null;
+          takenEnvironment: result.takenEnvironment,
+          releasedEnvironments: result.releasedEnvironments,
+        })
+      : { ok: true };
 
     return NextResponse.json({
       ok: true,
       assignments: result.state.assignments,
       startedAt: result.state.startedAt,
-      notification,
+      notificationError: notification.ok ? undefined : notification.error,
     });
   } catch {
     return NextResponse.json(

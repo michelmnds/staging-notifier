@@ -39,16 +39,7 @@ type MoveResponse = {
   assignments?: StagingAssignments;
   startedAt?: StagingStartedAt;
   occupiedByName?: string;
-  notification?: {
-    userName: string;
-    previousEnvironment: StagingEnvironment | null;
-    nextEnvironment: StagingEnvironment | null;
-  } | null;
-};
-
-type NotifyResponse = {
-  ok: boolean;
-  error?: string;
+  notificationError?: string;
 };
 
 type StatusResponse = {
@@ -668,28 +659,11 @@ export default function StagingDashboard({
 
       setAssignments(payload.assignments);
       setStartedAt(payload.startedAt);
-      setMessage("");
-
-      if (payload.notification) {
-        const slackResponse = await fetch("/api/staging/notify", {
-          method: "POST",
-          headers: {
-            "Content-Type": "application/json",
-          },
-          body: JSON.stringify(payload.notification),
-        });
-
-        const slackPayload = (await slackResponse.json()) as NotifyResponse;
-
-        if (!slackResponse.ok || !slackPayload.ok) {
-          setMessage(
-            `Status updated, but Slack failed: ${slackPayload.error || "unknown error"}.`,
-          );
-          return;
-        }
-
-        setMessage("");
-      }
+      setMessage(
+        payload.notificationError
+          ? `Status updated, but the #coders notification failed: ${payload.notificationError}.`
+          : "",
+      );
     } catch {
       setMessage("Could not reach server.");
     } finally {

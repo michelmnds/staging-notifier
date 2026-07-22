@@ -1,5 +1,7 @@
 import { promises as fs } from "node:fs";
+import { randomUUID } from "node:crypto";
 import path from "node:path";
+import { Redis } from "@upstash/redis";
 import users from "@/data/users.json";
 import {
   EMPTY_STAGING_ASSIGNMENTS,
@@ -16,14 +18,12 @@ export type StagingState = {
   assignments: StagingAssignments;
   startedAt: StagingStartedAt;
   updatedAt: string;
-  slackStatusMessageTs: string | null;
 };
 
 type LegacyStagingState = {
   usingStagingUserIds?: string[];
   startedAt?: unknown;
   updatedAt?: string;
-  slackStatusMessageTs?: string;
 };
 
 export type MoveUserResult =
@@ -33,6 +33,8 @@ export type MoveUserResult =
       state: StagingState;
       previousEnvironment: StagingEnvironment | null;
       nextEnvironment: StagingEnvironment | null;
+      releasedEnvironments: StagingEnvironment[];
+      takenEnvironment: StagingEnvironment | null;
     }
   | {
       ok: false;
@@ -48,17 +50,21 @@ const isVercelRuntime = Boolean(process.env.VERCEL || process.env.VERCEL_ENV);
 const stateFilePath = isVercelRuntime
   ? path.join("/tmp", "staging-state.json")
   : path.join(process.cwd(), "src", "data", "staging-state.json");
+const redisUrl = process.env.UPSTASH_REDIS_REST_URL?.trim();
+const redisToken = process.env.UPSTASH_REDIS_REST_TOKEN?.trim();
+const redis =
+  redisUrl && redisToken ? new Redis({ url: redisUrl, token: redisToken }) : null;
+const redisStateKey =
+  process.env.STAGING_STATE_REDIS_KEY?.trim() || "staging-notifier:state";
+const redisLockKey = `${redisStateKey}:lock`;
 
 const defaultState: StagingState = {
   assignments: { ...EMPTY_STAGING_ASSIGNMENTS },
   startedAt: { ...EMPTY_STAGING_STARTED_AT },
   updatedAt: "",
-  slackStatusMessageTs: null,
 };
 
 let inMemoryState: StagingState | null = null;
-let hasAttemptedSlackRecovery = false;
-let isRecoveringFromSlack = false;
 
 function createEmptyAssignments(): StagingAssignments {
   return { ...EMPTY_STAGING_ASSIGNMENTS };
@@ -148,62 +154,12 @@ function migrateLegacyState(parsed: LegacyStagingState): StagingAssignments {
   return nextAssignments;
 }
 
-function hasAssignedUsers(assignments: StagingAssignments) {
-  return STAGING_ENVIRONMENTS.some((environment) => Boolean(assignments[environment]));
-}
-
-function shouldAttemptSlackRecovery(state: StagingState) {
-  return (
-    isVercelRuntime &&
-    !hasAttemptedSlackRecovery &&
-    !isRecoveringFromSlack &&
-    !state.updatedAt &&
-    !state.slackStatusMessageTs &&
-    !hasAssignedUsers(state.assignments)
-  );
-}
-
-async function recoverStateFromSlack() {
-  if (!isVercelRuntime || hasAttemptedSlackRecovery || isRecoveringFromSlack) {
-    return null;
-  }
-
-  hasAttemptedSlackRecovery = true;
-  isRecoveringFromSlack = true;
-
-  try {
-    const slackModule = await import("@/lib/slack");
-    const recovered = await slackModule.recoverStagingStateFromSlack();
-
-    if (!recovered) {
-      return null;
-    }
-
-    const recoveredAssignments = sanitizeAssignments(recovered.assignments);
-    const recoveredState: StagingState = {
-      assignments: recoveredAssignments,
-      startedAt: sanitizeStartedAt(recovered.startedAt, recoveredAssignments),
-      updatedAt:
-        typeof recovered.updatedAt === "string" && recovered.updatedAt
-          ? recovered.updatedAt
-          : new Date().toISOString(),
-      slackStatusMessageTs:
-        typeof recovered.slackStatusMessageTs === "string"
-          ? recovered.slackStatusMessageTs
-          : null,
-    };
-
-    await writeState(recoveredState);
-    return recoveredState;
-  } catch {
-    return null;
-  } finally {
-    isRecoveringFromSlack = false;
-  }
-}
-
 async function writeState(state: StagingState) {
-  inMemoryState = state;
+  if (redis) {
+    await redis.set(redisStateKey, state);
+    inMemoryState = state;
+    return;
+  }
 
   try {
     await fs.mkdir(path.dirname(stateFilePath), { recursive: true });
@@ -213,6 +169,82 @@ async function writeState(state: StagingState) {
       throw error;
     }
   }
+
+  inMemoryState = state;
+}
+
+function parseStoredState(input: unknown) {
+  let parsedInput = input;
+
+  if (typeof parsedInput === "string") {
+    try {
+      parsedInput = JSON.parse(parsedInput) as unknown;
+    } catch {
+      parsedInput = {};
+    }
+  }
+
+  const parsed =
+    parsedInput && typeof parsedInput === "object"
+      ? (parsedInput as Partial<StagingState> & LegacyStagingState)
+      : {};
+  const hasAssignments =
+    parsed.assignments !== null &&
+    typeof parsed.assignments === "object" &&
+    !Array.isArray(parsed.assignments);
+  const hasStartedAt =
+    parsed.startedAt !== null &&
+    typeof parsed.startedAt === "object" &&
+    !Array.isArray(parsed.startedAt);
+  const assignments = hasAssignments
+    ? sanitizeAssignments(parsed.assignments)
+    : migrateLegacyState(parsed);
+  const updatedAt =
+    typeof parsed.updatedAt === "string" ? parsed.updatedAt : defaultState.updatedAt;
+  const startedAt = hasStartedAt
+    ? sanitizeStartedAt(parsed.startedAt, assignments)
+    : buildStartedAtFromUpdatedAt(assignments, updatedAt);
+
+  return {
+    state: { assignments, startedAt, updatedAt },
+    needsMigration: !hasAssignments || !hasStartedAt,
+  };
+}
+
+async function withStateLock<T>(operation: () => Promise<T>): Promise<T> {
+  if (!redis) {
+    return operation();
+  }
+
+  const lockToken = randomUUID();
+  const deadline = Date.now() + 2_000;
+
+  while (Date.now() < deadline) {
+    const acquired = await redis.set(redisLockKey, lockToken, {
+      nx: true,
+      px: 10_000,
+    });
+
+    if (acquired === "OK") {
+      try {
+        return await operation();
+      } finally {
+        try {
+          await redis.eval(
+            "if redis.call('get', KEYS[1]) == ARGV[1] then return redis.call('del', KEYS[1]) else return 0 end",
+            [redisLockKey],
+            [lockToken],
+          );
+        } catch {
+          // The lock expires automatically if Redis is unavailable during cleanup.
+        }
+      }
+    }
+
+    await new Promise((resolve) => setTimeout(resolve, 50));
+  }
+
+  throw new Error("Could not acquire staging state lock.");
 }
 
 export function findEnvironmentForUser(
@@ -256,49 +288,47 @@ export function getAssignedUserIds(assignments: StagingAssignments): string[] {
   return Array.from(ids);
 }
 
-export async function getStagingState(): Promise<StagingState> {
+async function readStagingState(allowCacheFallback: boolean): Promise<StagingState> {
+  if (redis) {
+    try {
+      const storedState = await redis.get<unknown>(redisStateKey);
+
+      if (storedState === null) {
+        const created = await redis.set(redisStateKey, defaultState, { nx: true });
+        if (created === "OK") {
+          inMemoryState = defaultState;
+          return defaultState;
+        }
+
+        const initializedState = await redis.get<unknown>(redisStateKey);
+        if (initializedState === null) {
+          throw new Error("Staging state initialization failed.");
+        }
+
+        const { state } = parseStoredState(initializedState);
+        inMemoryState = state;
+        return state;
+      }
+
+      const { state } = parseStoredState(storedState);
+      inMemoryState = state;
+
+      return state;
+    } catch (error) {
+      if (allowCacheFallback && inMemoryState) {
+        return inMemoryState;
+      }
+
+      throw error;
+    }
+  }
+
   try {
     const fileContent = await fs.readFile(stateFilePath, "utf8");
-    const parsed = JSON.parse(fileContent) as Partial<StagingState> & LegacyStagingState;
+    const { state, needsMigration } = parseStoredState(fileContent);
 
-    const hasAssignments =
-      parsed.assignments !== null &&
-      typeof parsed.assignments === "object" &&
-      !Array.isArray(parsed.assignments);
-    const hasStartedAt =
-      parsed.startedAt !== null &&
-      typeof parsed.startedAt === "object" &&
-      !Array.isArray(parsed.startedAt);
-
-    const assignments = hasAssignments
-      ? sanitizeAssignments(parsed.assignments)
-      : migrateLegacyState(parsed);
-    const updatedAt =
-      typeof parsed.updatedAt === "string" ? parsed.updatedAt : defaultState.updatedAt;
-    const startedAt =
-      hasStartedAt
-        ? sanitizeStartedAt(parsed.startedAt, assignments)
-        : buildStartedAtFromUpdatedAt(assignments, updatedAt);
-
-    const state: StagingState = {
-      assignments,
-      startedAt,
-      updatedAt,
-      slackStatusMessageTs:
-        typeof parsed.slackStatusMessageTs === "string"
-          ? parsed.slackStatusMessageTs
-          : defaultState.slackStatusMessageTs,
-    };
-
-    if (!hasAssignments || !hasStartedAt) {
+    if (needsMigration) {
       await writeState(state);
-    }
-
-    if (shouldAttemptSlackRecovery(state)) {
-      const recoveredState = await recoverStateFromSlack();
-      if (recoveredState) {
-        return recoveredState;
-      }
     }
 
     inMemoryState = state;
@@ -309,22 +339,21 @@ export async function getStagingState(): Promise<StagingState> {
       return inMemoryState;
     }
 
-    const recoveredState = await recoverStateFromSlack();
-    if (recoveredState) {
-      return recoveredState;
-    }
-
     await writeState(defaultState);
     return inMemoryState ?? defaultState;
   }
 }
 
-export async function moveUserToDestination(
+export async function getStagingState(): Promise<StagingState> {
+  return readStagingState(true);
+}
+
+async function moveUserWithoutLock(
   userId: string,
   destination: StagingDestination,
   sourceEnvironment: StagingEnvironment | null = null,
 ): Promise<MoveUserResult> {
-  const currentState = await getStagingState();
+  const currentState = await readStagingState(false);
   const assignments = { ...currentState.assignments };
   const startedAt = { ...currentState.startedAt };
   const previousEnvironments = getEnvironmentsForUser(assignments, userId);
@@ -339,6 +368,8 @@ export async function moveUserToDestination(
           state: currentState,
           previousEnvironment: null,
           nextEnvironment: null,
+          releasedEnvironments: [],
+          takenEnvironment: null,
         };
       }
 
@@ -349,7 +380,6 @@ export async function moveUserToDestination(
         assignments: sanitizeAssignments(assignments),
         startedAt: sanitizeStartedAt(startedAt, assignments),
         updatedAt: new Date().toISOString(),
-        slackStatusMessageTs: currentState.slackStatusMessageTs,
       };
 
       await writeState(nextState);
@@ -360,6 +390,8 @@ export async function moveUserToDestination(
         state: nextState,
         previousEnvironment: sourceEnvironment,
         nextEnvironment: null,
+        releasedEnvironments: [sourceEnvironment],
+        takenEnvironment: null,
       };
     }
 
@@ -370,6 +402,8 @@ export async function moveUserToDestination(
         state: currentState,
         previousEnvironment: null,
         nextEnvironment: null,
+        releasedEnvironments: [],
+        takenEnvironment: null,
       };
     }
 
@@ -382,7 +416,6 @@ export async function moveUserToDestination(
       assignments: sanitizeAssignments(assignments),
       startedAt: sanitizeStartedAt(startedAt, assignments),
       updatedAt: new Date().toISOString(),
-      slackStatusMessageTs: currentState.slackStatusMessageTs,
     };
 
     await writeState(nextState);
@@ -393,6 +426,8 @@ export async function moveUserToDestination(
       state: nextState,
       previousEnvironment,
       nextEnvironment: null,
+      releasedEnvironments: previousEnvironments,
+      takenEnvironment: null,
     };
   }
 
@@ -415,6 +450,8 @@ export async function moveUserToDestination(
       state: currentState,
       previousEnvironment,
       nextEnvironment: destination,
+      releasedEnvironments: [],
+      takenEnvironment: null,
     };
   }
 
@@ -425,7 +462,6 @@ export async function moveUserToDestination(
     assignments: sanitizeAssignments(assignments),
     startedAt: sanitizeStartedAt(startedAt, assignments),
     updatedAt: new Date().toISOString(),
-    slackStatusMessageTs: currentState.slackStatusMessageTs,
   };
 
   await writeState(nextState);
@@ -436,23 +472,19 @@ export async function moveUserToDestination(
     state: nextState,
     previousEnvironment,
     nextEnvironment: destination,
+    releasedEnvironments: [],
+    takenEnvironment: destination,
   };
 }
 
-export async function setSlackStatusMessageTs(ts: string | null) {
-  const currentState = await getStagingState();
-
-  if (currentState.slackStatusMessageTs === ts) {
-    return currentState;
-  }
-
-  const nextState: StagingState = {
-    ...currentState,
-    slackStatusMessageTs: ts,
-  };
-
-  await writeState(nextState);
-  return nextState;
+export async function moveUserToDestination(
+  userId: string,
+  destination: StagingDestination,
+  sourceEnvironment: StagingEnvironment | null = null,
+) {
+  return withStateLock(() =>
+    moveUserWithoutLock(userId, destination, sourceEnvironment),
+  );
 }
 
 export async function getStagingOccupancy() {
